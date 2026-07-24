@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use these workflows, please cite the associated article."
+title: "CRC miRNA Random Forest Signature"
+type: software
+authors:
+  - family-names: "Mustafa"
+    given-names: "Rebaz M."
+repository-code: "https://github.com/rebazmuhtasm-web/CRC-miRNA-RF-signature"
+license: "NOASSERTION"
+keywords:
+  - colorectal cancer
+  - microRNA
+  - random forest
+  - biomarker discovery
+  - external validation
+abstract: >-
+  Computational preprocessing, machine-learning, uncertainty-analysis and
+  pathway-enrichment workflows supporting an accepted study of a three-miRNA
+  random forest signature for colorectal cancer tissue discrimination.
+
