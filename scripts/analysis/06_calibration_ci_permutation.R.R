@@ -1,0 +1,841 @@
+###############################################################################
+# FIXED V2: unique run folder + file-lock-safe output; forced 83/21 split preserved.
+# RBZ thesis/reviewer outputs for the LOCKED three-miRNA Random Forest model
+# Forced 83/21 paired Train80/Test20 split
+#
+# Outputs generated:
+#   - Table 4.9 style: internal AUC estimates + 95% CIs
+#   - Table A.15 style: threshold-dependent metrics, exact 95% CIs, Brier scores
+#   - Table A.16 style: calibration-bin summaries
+#   - Table A.17 style: permutation-based AUC validation
+#   - Figure 4.13 style: stacked calibration plots A/B/C
+#   - Figure 4.14 style: stacked permutation null-distribution plots A/B/C
+#
+# HOW TO RUN:
+#   1) Run your main/master machine-learning script first.
+#   2) Then run this script in the same R session, or set PROJECT_DIR below to the
+#      project folder containing 04_Objects and 09_Final_Locked_Signature.
+#
+# IMPORTANT:
+#   - This script does NOT use createDataPartition(). It forces exactly 83 paired
+#     Train80 pairs and 21 paired Test20 pairs.
+#   - If old 83/21 split files are available, you can point OLD_TRAIN_INFO_FILE
+#     and OLD_TEST_INFO_FILE to them. Otherwise a deterministic 83/21 split is
+#     created with SPLIT_SEED.
+###############################################################################
+
+options(stringsAsFactors = FALSE)
+
+###############################################################################
+# 0) USER SETTINGS
+###############################################################################
+
+# If PROJECT_DIR already exists in your R session from the master script, it will
+# be used automatically. Otherwise, edit this path manually.
+if (!exists("PROJECT_DIR")) {
+  PROJECT_DIR <- getwd()
+}
+
+# Forced split settings
+FORCE_TRAIN_PAIRS <- 83
+FORCE_TEST_PAIRS  <- 21
+SPLIT_SEED <- 20260405
+RF_SEED    <- 20260410
+PERM_SEED  <- 20260701
+
+# Random Forest settings
+if (!exists("RF_NTREE")) RF_NTREE <- 1000
+THRESHOLD <- 0.5
+
+# Use old saved 83/21 train/test sample-info files if you have them.
+# Leave as NA to create a deterministic forced 83/21 split from large_after.
+OLD_TRAIN_INFO_FILE <- NA_character_
+OLD_TEST_INFO_FILE  <- NA_character_
+
+# Optional: if TRUE, the script also checks the usual split folder for existing
+# 83/21 split files. It will ignore them if they are 84/20 or any other size.
+USE_EXISTING_83_21_FILES_IF_FOUND <- TRUE
+
+# Locked miRNAs. If locked_mirs/final_signature are already in the R session,
+# they will be used. Otherwise, the script tries to read the final signature file.
+LOCKED_MIRS_FALLBACK <- c("hsa-miR-135b-5p", "hsa-miR-378a-5p", "hsa-miR-549a-5p")
+
+# Plot settings
+PLOT_DPI <- 300
+PLOT_WIDTH_IN  <- 7.2
+PLOT_HEIGHT_IN <- 10.5
+PANEL_LABEL_SIZE <- 2.2
+SHOW_SMALL_TITLES_CALIBRATION <- TRUE
+N_CALIBRATION_BINS <- 3
+N_PERMUTATIONS <- 1000
+
+# Output folder
+# IMPORTANT: every run is written into a NEW timestamped subfolder.
+# This prevents "Permission denied" errors when an older CSV/DOCX/PNG is open
+# in Excel, Word, Image Viewer, etc.
+OUT_BASE <- file.path(PROJECT_DIR, "13_Reviewer_83_21_Internal_Tables_and_Plots")
+RUN_STAMP <- format(Sys.time(), "%Y%m%d_%H%M%S")
+OUT_DIR <- file.path(OUT_BASE, paste0("Run_", RUN_STAMP))
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# Verify that R can write to the new output folder before analysis continues.
+.write_test <- file.path(OUT_DIR, paste0(".__write_test_", Sys.getpid(), ".tmp"))
+ok_write <- tryCatch({
+  writeLines("write_test", .write_test)
+  unlink(.write_test)
+  TRUE
+}, error = function(e) FALSE)
+if (!ok_write) stop("R cannot write to OUT_DIR: ", OUT_DIR,
+                    "\nPlease choose a writable PROJECT_DIR or check Windows folder permissions.")
+
+###############################################################################
+# 1) PACKAGES
+###############################################################################
+
+required_pkgs <- c("pROC", "randomForest", "dplyr")
+missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop("Please install required packages first: ", paste(missing_pkgs, collapse = ", "))
+}
+
+library(pROC)
+library(randomForest)
+library(dplyr)
+
+###############################################################################
+# 2) HELPER FUNCTIONS
+###############################################################################
+
+write_csv_safe <- function(x, file) {
+  dir.create(dirname(file), recursive = TRUE, showWarnings = FALSE)
+  tryCatch({
+    utils::write.csv(x, file = file, row.names = FALSE, na = "")
+    invisible(file)
+  }, error = function(e) {
+    # Windows commonly locks a CSV when it is open in Excel.
+    # Rather than stopping the whole analysis, save a timestamped fallback copy.
+    ext <- tools::file_ext(file)
+    stem <- if (nzchar(ext)) sub(paste0("\\.", ext, "$"), "", basename(file)) else basename(file)
+    alt <- file.path(dirname(file), paste0(stem, "_ALT_", format(Sys.time(), "%Y%m%d_%H%M%S"), if (nzchar(ext)) paste0(".", ext) else ""))
+    warning("Could not write requested file (possibly open/locked): ", file,
+            "\nOriginal error: ", conditionMessage(e),
+            "\nSaving fallback copy instead: ", alt)
+    utils::write.csv(x, file = alt, row.names = FALSE, na = "")
+    invisible(alt)
+  })
+}
+
+fmt3 <- function(x) ifelse(is.na(x), NA_character_, sprintf("%.3f", as.numeric(x)))
+fmt4 <- function(x) ifelse(is.na(x), NA_character_, sprintf("%.4f", as.numeric(x)))
+fmt_sci <- function(x) ifelse(is.na(x), NA_character_, formatC(as.numeric(x), format = "e", digits = 2))
+
+normalize_group <- function(x) {
+  x <- trimws(as.character(x))
+  out <- ifelse(grepl("tumou?r|cancer|crc|case", x, ignore.case = TRUE), "Tumor",
+                ifelse(grepl("normal|control|adjacent", x, ignore.case = TRUE), "Normal", x))
+  factor(out, levels = c("Normal", "Tumor"))
+}
+
+sanitize_id <- function(x) {
+  gsub("[[:space:]]+", "", trimws(as.character(x)))
+}
+
+get_sample_col <- function(info, expr_cols) {
+  candidates <- c("SampleID", "sample_id", "Sample", "sample", "Run", "run", "SRR", "GSM", "ID", "id")
+  candidates <- candidates[candidates %in% colnames(info)]
+  if (length(candidates) > 0) {
+    scores <- vapply(candidates, function(cc) sum(sanitize_id(info[[cc]]) %in% sanitize_id(expr_cols)), numeric(1))
+    return(candidates[which.max(scores)])
+  }
+  scores <- vapply(colnames(info), function(cc) sum(sanitize_id(info[[cc]]) %in% sanitize_id(expr_cols)), numeric(1))
+  colnames(info)[which.max(scores)]
+}
+
+get_group_col <- function(info) {
+  candidates <- c("Group", "group", "Class", "class", "Condition", "condition", "Type", "type", "Status", "status")
+  hit <- candidates[candidates %in% colnames(info)]
+  if (length(hit) > 0) return(hit[1])
+  for (cc in colnames(info)) {
+    vals <- unique(tolower(as.character(info[[cc]])))
+    if (any(grepl("tumou?r|cancer|crc|case", vals)) && any(grepl("normal|control|adjacent", vals))) return(cc)
+  }
+  stop("Could not detect tumour/normal group column in large_after$info.")
+}
+
+get_pair_col <- function(info) {
+  candidates <- c("pair_id", "PairID", "pair", "pairID", "pair.id", "Pair", "PAIR")
+  hit <- candidates[candidates %in% colnames(info)]
+  if (length(hit) > 0) return(hit[1])
+  stop("Could not detect pair_id column in large_after$info. Paired split cannot be forced.")
+}
+
+safe_auc <- function(y, prob) {
+  y <- normalize_group(y)
+  if (length(unique(y[!is.na(y)])) < 2) return(list(auc = NA_real_, roc = NULL))
+  roc_obj <- tryCatch(
+    pROC::roc(y, prob, levels = c("Normal", "Tumor"), direction = "<", quiet = TRUE),
+    error = function(e) NULL
+  )
+  if (is.null(roc_obj)) return(list(auc = NA_real_, roc = NULL))
+  list(auc = as.numeric(pROC::auc(roc_obj)), roc = roc_obj)
+}
+
+safe_auc_ci <- function(y, prob, dataset, method_preference = "delong") {
+  r <- safe_auc(y, prob)
+  if (is.null(r$roc) || is.na(r$auc)) {
+    return(data.frame(
+      Assessment_layer = dataset, n_pair = NA_integer_, AUC = NA_real_,
+      CI_low = NA_real_, CI_high = NA_real_, CI_method = "not estimable"
+    ))
+  }
+
+  ci_method <- "DeLong"
+  ci <- tryCatch(suppressWarnings(pROC::ci.auc(r$roc, method = method_preference)), error = function(e) NULL)
+  if (is.null(ci) || any(is.na(as.numeric(ci)))) {
+    ci_method <- "Bootstrap"
+    ci <- tryCatch(suppressWarnings(pROC::ci.auc(r$roc, method = "bootstrap", boot.n = 2000)), error = function(e) NULL)
+  }
+  if (is.null(ci) || any(is.na(as.numeric(ci)))) {
+    lo <- NA_real_; hi <- NA_real_; ci_method <- "not estimable"
+  } else {
+    ci <- as.numeric(ci)
+    lo <- ci[1]; hi <- ci[3]
+  }
+
+  data.frame(
+    Assessment_layer = dataset,
+    n_pair = sum(y == "Tumor", na.rm = TRUE),
+    AUC = r$auc,
+    CI_low = lo,
+    CI_high = hi,
+    CI_method = ci_method,
+    stringsAsFactors = FALSE
+  )
+}
+
+exact_binom_ci <- function(success, total) {
+  if (is.na(total) || total <= 0) return(c(NA_real_, NA_real_))
+  as.numeric(stats::binom.test(success, total)$conf.int)
+}
+
+threshold_metrics <- function(y, prob, dataset, threshold = 0.5) {
+  y <- normalize_group(y)
+  pred <- factor(ifelse(prob >= threshold, "Tumor", "Normal"), levels = c("Normal", "Tumor"))
+  y01 <- ifelse(y == "Tumor", 1, 0)
+
+  TP <- sum(y == "Tumor"  & pred == "Tumor",  na.rm = TRUE)
+  TN <- sum(y == "Normal" & pred == "Normal", na.rm = TRUE)
+  FP <- sum(y == "Normal" & pred == "Tumor",  na.rm = TRUE)
+  FN <- sum(y == "Tumor"  & pred == "Normal", na.rm = TRUE)
+
+  n <- TP + TN + FP + FN
+  acc_num <- TP + TN
+  sens_den <- TP + FN
+  spec_den <- TN + FP
+  prec_den <- TP + FP
+
+  acc_ci  <- exact_binom_ci(acc_num, n)
+  sens_ci <- exact_binom_ci(TP, sens_den)
+  spec_ci <- exact_binom_ci(TN, spec_den)
+  prec_ci <- exact_binom_ci(TP, prec_den)
+
+  data.frame(
+    Assessment_layer = dataset,
+    n_total = n,
+    n_pair = sum(y == "Tumor", na.rm = TRUE),
+    TP = TP, TN = TN, FP = FP, FN = FN,
+    Accuracy = acc_num / n,
+    Accuracy_low = acc_ci[1], Accuracy_high = acc_ci[2],
+    Sensitivity = ifelse(sens_den > 0, TP / sens_den, NA_real_),
+    Sensitivity_low = sens_ci[1], Sensitivity_high = sens_ci[2],
+    Specificity = ifelse(spec_den > 0, TN / spec_den, NA_real_),
+    Specificity_low = spec_ci[1], Specificity_high = spec_ci[2],
+    Precision = ifelse(prec_den > 0, TP / prec_den, NA_real_),
+    Precision_low = prec_ci[1], Precision_high = prec_ci[2],
+    Brier_score = mean((prob - y01)^2, na.rm = TRUE),
+    stringsAsFactors = FALSE
+  )
+}
+
+make_metric_string <- function(est, lo, hi) {
+  # Vectorised formatter: mutate() passes whole columns, not one scalar value.
+  # The previous scalar `if (is.na(est))` caused: "condition has length > 1".
+  out <- paste0(fmt3(est), " (", fmt3(lo), "-", fmt3(hi), ")")
+  out[is.na(est)] <- NA_character_
+  out
+}
+
+calibration_bins <- function(y, prob, dataset, n_bins = 3) {
+  y <- normalize_group(y)
+  y01 <- ifelse(y == "Tumor", 1, 0)
+  df <- data.frame(y01 = y01, prob = as.numeric(prob))
+
+  # Quantile-based bins. Duplicate breaks are dropped automatically, which is
+  # appropriate for highly polarized Random Forest probabilities.
+  br <- unique(as.numeric(stats::quantile(df$prob, probs = seq(0, 1, length.out = n_bins + 1), na.rm = TRUE, type = 7)))
+  if (length(br) < 3) {
+    br <- unique(c(min(df$prob, na.rm = TRUE), median(df$prob, na.rm = TRUE), max(df$prob, na.rm = TRUE)))
+  }
+  eps <- 1e-12
+  br[1] <- br[1] - eps
+  br[length(br)] <- br[length(br)] + eps
+
+  if (length(unique(br)) < 3) {
+    # fallback: two fixed bins if probabilities are almost all identical
+    br <- c(min(df$prob, na.rm = TRUE) - eps, 0.5, max(df$prob, na.rm = TRUE) + eps)
+    br <- unique(br)
+  }
+
+  df$Calibration_bin <- cut(df$prob, breaks = br, include.lowest = TRUE, labels = FALSE)
+  df <- df[!is.na(df$Calibration_bin), , drop = FALSE]
+  df$Calibration_bin <- as.integer(factor(df$Calibration_bin, levels = sort(unique(df$Calibration_bin))))
+
+  out <- df |>
+    group_by(Calibration_bin) |>
+    summarise(
+      n = dplyr::n(),
+      Mean_predicted_tumor_probability = mean(prob, na.rm = TRUE),
+      Observed_tumor_fraction = mean(y01, na.rm = TRUE),
+      Difference = Mean_predicted_tumor_probability - Observed_tumor_fraction,
+      .groups = "drop"
+    ) |>
+    mutate(Assessment_layer = dataset) |>
+    select(Assessment_layer, Calibration_bin, n,
+           Mean_predicted_tumor_probability, Observed_tumor_fraction, Difference)
+
+  as.data.frame(out)
+}
+
+permutation_auc_test <- function(y, prob, dataset, B = 1000, seed = 20260701) {
+  y <- normalize_group(y)
+  obs <- safe_auc(y, prob)$auc
+  set.seed(seed)
+  null_auc <- replicate(B, {
+    yp <- sample(y)
+    safe_auc(yp, prob)$auc
+  })
+  p_emp <- (1 + sum(null_auc >= obs, na.rm = TRUE)) / (B + 1)
+
+  list(
+    summary = data.frame(
+      Assessment_layer = dataset,
+      Observed_AUC = obs,
+      Permutations = B,
+      Empirical_P = p_emp,
+      Permuted_AUC_mean = mean(null_auc, na.rm = TRUE),
+      Permuted_AUC_SD = sd(null_auc, na.rm = TRUE),
+      Null_95_low = as.numeric(stats::quantile(null_auc, 0.025, na.rm = TRUE)),
+      Null_95_high = as.numeric(stats::quantile(null_auc, 0.975, na.rm = TRUE)),
+      stringsAsFactors = FALSE
+    ),
+    null_auc = data.frame(Assessment_layer = dataset, Permuted_AUC = null_auc)
+  )
+}
+
+###############################################################################
+# 3) LOAD REQUIRED OBJECTS IF NEEDED
+###############################################################################
+
+if (!exists("large_after")) {
+  rds_candidates <- c(
+    file.path(PROJECT_DIR, "04_Objects", "RBZ_step3_large_preprocessed.rds"),
+    file.path(PROJECT_DIR, "04_Objects", "RBZ_step4_train_test_split.rds")
+  )
+  rds_candidates <- rds_candidates[file.exists(rds_candidates)]
+  if (length(rds_candidates) == 0) {
+    stop("large_after was not found in the R session and no suitable RDS file was found in PROJECT_DIR/04_Objects.")
+  }
+  obj <- readRDS(rds_candidates[1])
+  if ("large_after" %in% names(obj)) {
+    large_after <- obj$large_after
+  } else {
+    stop("The RDS file was found but did not contain large_after. Run the master script first.")
+  }
+}
+
+if (!exists("locked_mirs")) {
+  if (exists("final_signature") && "miRNA" %in% colnames(final_signature)) {
+    locked_mirs <- final_signature$miRNA
+  } else {
+    sig_file <- file.path(PROJECT_DIR, "09_Final_Locked_Signature", "Table_Final_Locked_Signature.csv")
+    if (file.exists(sig_file)) {
+      sig <- utils::read.csv(sig_file, stringsAsFactors = FALSE, check.names = FALSE)
+      mir_col <- intersect(c("miRNA", "mirna", "Mature_miRNA", "mature_miRNA"), colnames(sig))[1]
+      if (!is.na(mir_col)) locked_mirs <- sig[[mir_col]] else locked_mirs <- LOCKED_MIRS_FALLBACK
+    } else {
+      locked_mirs <- LOCKED_MIRS_FALLBACK
+    }
+  }
+}
+locked_mirs <- unique(as.character(locked_mirs))
+
+###############################################################################
+# 4) PREPARE LARGE DATA AND FORCE 83/21 PAIRED SPLIT
+###############################################################################
+
+expr <- large_after$expr_native
+info <- as.data.frame(large_after$info, stringsAsFactors = FALSE)
+
+sample_col <- get_sample_col(info, colnames(expr))
+group_col <- get_group_col(info)
+pair_col <- get_pair_col(info)
+
+info$SampleID_FORCED <- sanitize_id(info[[sample_col]])
+info$Group_FORCED <- normalize_group(info[[group_col]])
+info$pair_id_FORCED <- as.character(info[[pair_col]])
+
+# Reorder expression columns to match metadata rows
+common_samples <- intersect(colnames(expr), info$SampleID_FORCED)
+if (length(common_samples) == 0) stop("No overlap between expression matrix columns and metadata sample IDs.")
+info <- info[match(common_samples, info$SampleID_FORCED), , drop = FALSE]
+expr <- expr[, common_samples, drop = FALSE]
+
+if (!all(locked_mirs %in% rownames(expr))) {
+  missing_mirs <- setdiff(locked_mirs, rownames(expr))
+  stop("The following locked miRNAs are missing from large_after$expr_native: ", paste(missing_mirs, collapse = ", "))
+}
+
+pair_ids <- unique(info$pair_id_FORCED)
+pair_ids <- pair_ids[!is.na(pair_ids) & nzchar(pair_ids)]
+if (length(pair_ids) != (FORCE_TRAIN_PAIRS + FORCE_TEST_PAIRS)) {
+  stop("Expected ", FORCE_TRAIN_PAIRS + FORCE_TEST_PAIRS, " unique pairs, but found ", length(pair_ids), ". Check pair_id metadata.")
+}
+
+load_split_from_files <- function(train_file, test_file) {
+  if (is.na(train_file) || is.na(test_file) || !file.exists(train_file) || !file.exists(test_file)) return(NULL)
+  tr <- utils::read.csv(train_file, stringsAsFactors = FALSE, check.names = FALSE)
+  te <- utils::read.csv(test_file, stringsAsFactors = FALSE, check.names = FALSE)
+  tr_pair_col <- get_pair_col(tr)
+  te_pair_col <- get_pair_col(te)
+  tr_ids <- unique(as.character(tr[[tr_pair_col]]))
+  te_ids <- unique(as.character(te[[te_pair_col]]))
+  tr_ids <- tr_ids[!is.na(tr_ids) & nzchar(tr_ids)]
+  te_ids <- te_ids[!is.na(te_ids) & nzchar(te_ids)]
+  if (length(tr_ids) == FORCE_TRAIN_PAIRS && length(te_ids) == FORCE_TEST_PAIRS && length(intersect(tr_ids, te_ids)) == 0) {
+    return(list(train_pair_ids = tr_ids, test_pair_ids = te_ids, source = paste("existing split files:", basename(train_file), basename(test_file))))
+  }
+  NULL
+}
+
+split_obj <- load_split_from_files(OLD_TRAIN_INFO_FILE, OLD_TEST_INFO_FILE)
+
+if (is.null(split_obj) && USE_EXISTING_83_21_FILES_IF_FOUND) {
+  candidate_train <- file.path(PROJECT_DIR, "06_Train_Test_Split", "sample_info_train80.csv")
+  candidate_test  <- file.path(PROJECT_DIR, "06_Train_Test_Split", "sample_info_test20.csv")
+  split_obj <- load_split_from_files(candidate_train, candidate_test)
+}
+
+if (is.null(split_obj)) {
+  set.seed(SPLIT_SEED)
+  train_pair_ids <- sample(sort(pair_ids), size = FORCE_TRAIN_PAIRS, replace = FALSE)
+  test_pair_ids  <- setdiff(pair_ids, train_pair_ids)
+  split_source <- paste0("deterministic forced split with seed ", SPLIT_SEED)
+} else {
+  train_pair_ids <- split_obj$train_pair_ids
+  test_pair_ids  <- split_obj$test_pair_ids
+  split_source <- split_obj$source
+}
+
+train_idx <- which(info$pair_id_FORCED %in% train_pair_ids)
+test_idx  <- which(info$pair_id_FORCED %in% test_pair_ids)
+
+train_info <- info[train_idx, , drop = FALSE]
+test_info  <- info[test_idx,  , drop = FALSE]
+
+# Checks
+if (length(unique(train_info$pair_id_FORCED)) != FORCE_TRAIN_PAIRS) stop("Forced Train80 split does not contain 83 pairs.")
+if (length(unique(test_info$pair_id_FORCED))  != FORCE_TEST_PAIRS)  stop("Forced Test20 split does not contain 21 pairs.")
+if (nrow(train_info) != FORCE_TRAIN_PAIRS * 2) warning("Train80 does not contain exactly two samples per pair. Please check metadata.")
+if (nrow(test_info)  != FORCE_TEST_PAIRS  * 2) warning("Test20 does not contain exactly two samples per pair. Please check metadata.")
+
+x_train <- t(expr[locked_mirs, train_info$SampleID_FORCED, drop = FALSE])
+x_test  <- t(expr[locked_mirs, test_info$SampleID_FORCED,  drop = FALSE])
+x_full  <- t(expr[locked_mirs, info$SampleID_FORCED,       drop = FALSE])
+
+y_train <- normalize_group(train_info$Group_FORCED)
+y_test  <- normalize_group(test_info$Group_FORCED)
+y_full  <- normalize_group(info$Group_FORCED)
+
+write_csv_safe(train_info, file.path(OUT_DIR, "sample_info_train80_FORCED_83_pairs.csv"))
+write_csv_safe(test_info,  file.path(OUT_DIR, "sample_info_test20_FORCED_21_pairs.csv"))
+write_csv_safe(data.frame(
+  Split_source = split_source,
+  Train_pairs = length(unique(train_info$pair_id_FORCED)),
+  Train_individual_samples = nrow(train_info),
+  Test_pairs = length(unique(test_info$pair_id_FORCED)),
+  Test_individual_samples = nrow(test_info),
+  Full_pairs = length(unique(info$pair_id_FORCED)),
+  Full_individual_samples = nrow(info),
+  Locked_miRNAs = paste(locked_mirs, collapse = "; "),
+  RF_NTREE = RF_NTREE,
+  Threshold = THRESHOLD,
+  stringsAsFactors = FALSE
+), file.path(OUT_DIR, "Table_Split_and_Model_Summary_FORCED_83_21.csv"))
+
+###############################################################################
+# 5) RETRAIN LOCKED RANDOM FOREST ON FORCED 83-PAIR TRAIN80
+###############################################################################
+
+set.seed(RF_SEED)
+rf_fit_forced_83_21 <- randomForest::randomForest(
+  x = x_train,
+  y = y_train,
+  ntree = RF_NTREE,
+  importance = TRUE
+)
+
+train_prob <- as.numeric(predict(rf_fit_forced_83_21, newdata = x_train, type = "prob")[, "Tumor"])
+test_prob  <- as.numeric(predict(rf_fit_forced_83_21, newdata = x_test,  type = "prob")[, "Tumor"])
+full_prob  <- as.numeric(predict(rf_fit_forced_83_21, newdata = x_full,  type = "prob")[, "Tumor"])
+
+pred_sets <- list(
+  Train80 = list(y = y_train, prob = train_prob, n_pair = FORCE_TRAIN_PAIRS),
+  Test20 = list(y = y_test, prob = test_prob, n_pair = FORCE_TEST_PAIRS),
+  `Full large cohort (supportive)` = list(y = y_full, prob = full_prob, n_pair = FORCE_TRAIN_PAIRS + FORCE_TEST_PAIRS)
+)
+
+pred_tbl <- dplyr::bind_rows(lapply(names(pred_sets), function(nm) {
+  data.frame(
+    Assessment_layer = nm,
+    Group = as.character(pred_sets[[nm]]$y),
+    Tumor_probability = pred_sets[[nm]]$prob,
+    Predicted_class = ifelse(pred_sets[[nm]]$prob >= THRESHOLD, "Tumor", "Normal"),
+    stringsAsFactors = FALSE
+  )
+}))
+write_csv_safe(pred_tbl, file.path(OUT_DIR, "All_Internal_Locked_RF_Predictions_FORCED_83_21.csv"))
+
+###############################################################################
+# 6) TABLE 4.9 STYLE: AUC AND 95% CI
+###############################################################################
+
+auc_raw <- dplyr::bind_rows(lapply(names(pred_sets), function(nm) {
+  safe_auc_ci(pred_sets[[nm]]$y, pred_sets[[nm]]$prob, nm)
+}))
+
+auc_thesis <- auc_raw |>
+  mutate(
+    `n (Pair)` = n_pair,
+    AUC = fmt3(AUC),
+    `95% CI` = paste0(fmt3(CI_low), "-", fmt3(CI_high)),
+    `CI method` = CI_method
+  ) |>
+  select(`Assessment layer` = Assessment_layer, `n (Pair)`, AUC, `95% CI`, `CI method`)
+
+write_csv_safe(auc_raw, file.path(OUT_DIR, "Table_4_9_Internal_AUC_CI_RAW_FORCED_83_21.csv"))
+write_csv_safe(auc_thesis, file.path(OUT_DIR, "Table_4_9_Internal_AUC_CI_THESIS_READY_FORCED_83_21.csv"))
+
+###############################################################################
+# 7) TABLE A.15 STYLE: THRESHOLD METRICS, EXACT 95% CI, BRIER SCORE
+###############################################################################
+
+metrics_raw <- dplyr::bind_rows(lapply(names(pred_sets), function(nm) {
+  threshold_metrics(pred_sets[[nm]]$y, pred_sets[[nm]]$prob, nm, threshold = THRESHOLD)
+}))
+
+metrics_thesis <- metrics_raw |>
+  mutate(
+    `Accuracy (95% CI)` = make_metric_string(Accuracy, Accuracy_low, Accuracy_high),
+    `Sensitivity (95% CI)` = make_metric_string(Sensitivity, Sensitivity_low, Sensitivity_high),
+    `Specificity (95% CI)` = make_metric_string(Specificity, Specificity_low, Specificity_high),
+    `Precision (95% CI)` = make_metric_string(Precision, Precision_low, Precision_high),
+    `Brier score` = fmt4(Brier_score)
+  ) |>
+  select(`Assessment layer` = Assessment_layer,
+         `Accuracy (95% CI)`, `Sensitivity (95% CI)`, `Specificity (95% CI)`,
+         `Precision (95% CI)`, `Brier score`)
+
+write_csv_safe(metrics_raw, file.path(OUT_DIR, "Table_A15_Threshold_Metrics_Brier_RAW_FORCED_83_21.csv"))
+write_csv_safe(metrics_thesis, file.path(OUT_DIR, "Table_A15_Threshold_Metrics_Brier_THESIS_READY_FORCED_83_21.csv"))
+
+###############################################################################
+# 8) TABLE A.16 STYLE: CALIBRATION BIN SUMMARY
+###############################################################################
+
+calib_raw <- dplyr::bind_rows(lapply(names(pred_sets), function(nm) {
+  calibration_bins(pred_sets[[nm]]$y, pred_sets[[nm]]$prob, nm, n_bins = N_CALIBRATION_BINS)
+}))
+
+calib_thesis <- calib_raw |>
+  mutate(
+    `Calibration bin` = Calibration_bin,
+    `Mean predicted tumor probability` = fmt3(Mean_predicted_tumor_probability),
+    `Observed tumor fraction` = fmt3(Observed_tumor_fraction),
+    Difference = fmt3(Difference)
+  ) |>
+  select(`Assessment layer` = Assessment_layer, `Calibration bin`, n,
+         `Mean predicted tumor probability`, `Observed tumor fraction`, Difference)
+
+write_csv_safe(calib_raw, file.path(OUT_DIR, "Table_A16_Calibration_Bins_RAW_FORCED_83_21.csv"))
+write_csv_safe(calib_thesis, file.path(OUT_DIR, "Table_A16_Calibration_Bins_THESIS_READY_FORCED_83_21.csv"))
+
+###############################################################################
+# 9) FIGURE 4.13 STYLE: CALIBRATION PLOTS A/B/C — THESIS-READY FIXED VERSION
+###############################################################################
+
+# This version fixes the clipped A/B/C labels, reduces oversized titles,
+# improves panel spacing, and draws the grid behind the calibration curve.
+# It also writes separate A/B/C panels in addition to the combined figure.
+
+plot_one_calibration <- function(dd, nm, panel_letter = NULL, add_panel_letter = TRUE) {
+  title_txt <- if (SHOW_SMALL_TITLES_CALIBRATION) {
+    paste0("Calibration plot: ",
+           gsub(" \\(supportive\\)", "",
+                gsub("Full large cohort", "FullLarge", nm)))
+  } else ""
+
+  # Draw empty plotting region first so the grid stays behind the data.
+  plot(NA, NA,
+       xlim = c(0, 1), ylim = c(0, 1),
+       xaxs = "i", yaxs = "i",
+       xlab = "Mean predicted tumor probability",
+       ylab = "Observed tumor fraction",
+       main = "",
+       axes = TRUE)
+
+  grid(nx = 6, ny = 6, col = "grey88", lty = 3)
+  abline(0, 1, lty = 2, lwd = 1.1)
+  lines(dd$Mean_predicted_tumor_probability,
+        dd$Observed_tumor_fraction,
+        lwd = 1.2)
+  points(dd$Mean_predicted_tumor_probability,
+         dd$Observed_tumor_fraction,
+         pch = 16, cex = 0.9)
+
+  if (nzchar(title_txt)) {
+    title(main = title_txt, cex.main = 0.82, font.main = 2, line = 0.45)
+  }
+
+  # IMPORTANT: adj=0 keeps the panel letter aligned with the left plot edge.
+  # No negative adj is used, so A/B/C will not be clipped.
+  if (add_panel_letter && !is.null(panel_letter)) {
+    mtext(panel_letter, side = 3, line = 0.45,
+          adj = 0, font = 2, cex = 1.65)
+  }
+}
+
+plot_calibration_panels <- function(calib_raw, file_base) {
+  layers <- names(pred_sets)
+
+  png(file.path(OUT_DIR, paste0(file_base, ".png")),
+      width = 6.6, height = 9.8, units = "in", res = PLOT_DPI)
+  oldpar <- par(no.readonly = TRUE)
+  on.exit({par(oldpar); dev.off()}, add = TRUE)
+
+  par(mfrow = c(3, 1),
+      mar = c(4.0, 4.3, 2.25, 1.0),
+      oma = c(0.15, 0.15, 0.15, 0.15),
+      mgp = c(2.45, 0.72, 0),
+      tcl = -0.25,
+      cex.axis = 0.82,
+      cex.lab = 0.90)
+
+  for (i in seq_along(layers)) {
+    nm <- layers[i]
+    dd <- calib_raw[calib_raw$Assessment_layer == nm, , drop = FALSE]
+    plot_one_calibration(dd, nm, LETTERS[i], add_panel_letter = TRUE)
+  }
+}
+
+plot_calibration_panels(calib_raw, "Figure_4_13_Calibration_Plots_FORCED_83_21_FIXED")
+
+# Vector PDF version
+pdf(file.path(OUT_DIR, "Figure_4_13_Calibration_Plots_FORCED_83_21_FIXED.pdf"),
+    width = 6.6, height = 9.8, useDingbats = FALSE)
+oldpar <- par(no.readonly = TRUE)
+par(mfrow = c(3, 1),
+    mar = c(4.0, 4.3, 2.25, 1.0),
+    oma = c(0.15, 0.15, 0.15, 0.15),
+    mgp = c(2.45, 0.72, 0),
+    tcl = -0.25,
+    cex.axis = 0.82,
+    cex.lab = 0.90)
+for (i in seq_along(names(pred_sets))) {
+  nm <- names(pred_sets)[i]
+  dd <- calib_raw[calib_raw$Assessment_layer == nm, , drop = FALSE]
+  plot_one_calibration(dd, nm, LETTERS[i], add_panel_letter = TRUE)
+}
+par(oldpar)
+dev.off()
+
+# Separate high-resolution panels, useful for Word/thesis layout if needed.
+for (i in seq_along(names(pred_sets))) {
+  nm <- names(pred_sets)[i]
+  dd <- calib_raw[calib_raw$Assessment_layer == nm, , drop = FALSE]
+  png(file.path(OUT_DIR, paste0("Figure_4_13", LETTERS[i], "_Calibration_", gsub("[^A-Za-z0-9]+", "_", nm), ".png")),
+      width = 6.4, height = 3.7, units = "in", res = PLOT_DPI)
+  oldpar <- par(no.readonly = TRUE)
+  par(mar = c(4.0, 4.3, 2.2, 1.0), mgp = c(2.45, 0.72, 0),
+      tcl = -0.25, cex.axis = 0.85, cex.lab = 0.92)
+  plot_one_calibration(dd, nm, LETTERS[i], add_panel_letter = TRUE)
+  par(oldpar)
+  dev.off()
+}
+
+###############################################################################
+# 10) TABLE A.17 STYLE: PERMUTATION-BASED AUC VALIDATION
+###############################################################################
+
+perm_results <- lapply(seq_along(names(pred_sets)), function(i) {
+  nm <- names(pred_sets)[i]
+  permutation_auc_test(pred_sets[[nm]]$y, pred_sets[[nm]]$prob, nm,
+                       B = N_PERMUTATIONS, seed = PERM_SEED + i - 1)
+})
+names(perm_results) <- names(pred_sets)
+
+perm_raw <- dplyr::bind_rows(lapply(perm_results, `[[`, "summary"))
+perm_null <- dplyr::bind_rows(lapply(perm_results, `[[`, "null_auc"))
+
+perm_thesis <- perm_raw |>
+  mutate(
+    `Observed AUC` = fmt3(Observed_AUC),
+    Permutations = as.integer(Permutations),
+    `Empirical P` = fmt_sci(Empirical_P),
+    `Permuted AUC mean` = fmt3(Permuted_AUC_mean),
+    `Permuted AUC SD` = fmt3(Permuted_AUC_SD),
+    `95% null AUC range` = paste0(fmt3(Null_95_low), "-", fmt3(Null_95_high))
+  ) |>
+  select(`Assessment layer` = Assessment_layer, `Observed AUC`, Permutations,
+         `Empirical P`, `Permuted AUC mean`, `Permuted AUC SD`, `95% null AUC range`)
+
+write_csv_safe(perm_raw,  file.path(OUT_DIR, "Table_A17_Permutation_AUC_RAW_FORCED_83_21.csv"))
+write_csv_safe(perm_null, file.path(OUT_DIR, "Permutation_Null_AUC_All_Internal_FORCED_83_21.csv"))
+write_csv_safe(perm_thesis, file.path(OUT_DIR, "Table_A17_Permutation_AUC_THESIS_READY_FORCED_83_21.csv"))
+
+###############################################################################
+# 11) FIGURE 4.14 STYLE: PERMUTATION NULL DISTRIBUTIONS A/B/C — FIXED VERSION
+###############################################################################
+
+# This version fixes clipped A/B/C labels and makes the annotation placement
+# consistent across Train80, Test20, and the supportive full cohort.
+
+plot_one_permutation <- function(null_auc, obs, panel_letter = NULL, add_panel_letter = TRUE) {
+  h <- hist(null_auc,
+            breaks = 25,
+            plot = FALSE)
+
+  # Plot with a little headroom so the annotation does not collide with bars.
+  hist(null_auc,
+       breaks = h$breaks,
+       xlab = "Permuted-label AUC",
+       ylab = "Frequency",
+       main = "",
+       ylim = c(0, max(h$counts) * 1.12),
+       xaxs = "i", yaxs = "i")
+
+  usr <- par("usr")
+
+  # AUC=1.000 lies far outside the null distribution.  Keeping the histogram
+  # focused around the null distribution avoids visually compressing it.
+  # The observed value is therefore reported explicitly in the upper-right.
+  text(x = usr[2] - 0.015 * diff(usr[1:2]),
+       y = usr[4] - 0.09 * diff(usr[3:4]),
+       labels = paste0("Observed AUC = ", fmt3(obs)),
+       adj = 1, cex = 0.82)
+
+  # Only draw the observed-AUC vertical line if it is inside the displayed range.
+  if (is.finite(obs) && obs >= usr[1] && obs <= usr[2]) {
+    abline(v = obs, lty = 2, lwd = 1.1)
+  }
+
+  if (add_panel_letter && !is.null(panel_letter)) {
+    mtext(panel_letter, side = 3, line = 0.45,
+          adj = 0, font = 2, cex = 1.65)
+  }
+}
+
+plot_permutation_panels <- function(perm_null, perm_raw, file_base) {
+  layers <- names(pred_sets)
+
+  png(file.path(OUT_DIR, paste0(file_base, ".png")),
+      width = 6.6, height = 9.8, units = "in", res = PLOT_DPI)
+  oldpar <- par(no.readonly = TRUE)
+  on.exit({par(oldpar); dev.off()}, add = TRUE)
+
+  par(mfrow = c(3, 1),
+      mar = c(4.0, 4.3, 2.15, 1.0),
+      oma = c(0.15, 0.15, 0.15, 0.15),
+      mgp = c(2.45, 0.72, 0),
+      tcl = -0.25,
+      cex.axis = 0.82,
+      cex.lab = 0.90)
+
+  for (i in seq_along(layers)) {
+    nm <- layers[i]
+    null_auc <- perm_null$Permuted_AUC[perm_null$Assessment_layer == nm]
+    obs <- perm_raw$Observed_AUC[perm_raw$Assessment_layer == nm][1]
+    plot_one_permutation(null_auc, obs, LETTERS[i], add_panel_letter = TRUE)
+  }
+}
+
+plot_permutation_panels(
+  perm_null, perm_raw,
+  "Figure_4_14_Permutation_AUC_Null_Distributions_FORCED_83_21_FIXED"
+)
+
+# Vector PDF version
+pdf(file.path(OUT_DIR, "Figure_4_14_Permutation_AUC_Null_Distributions_FORCED_83_21_FIXED.pdf"),
+    width = 6.6, height = 9.8, useDingbats = FALSE)
+oldpar <- par(no.readonly = TRUE)
+par(mfrow = c(3, 1),
+    mar = c(4.0, 4.3, 2.15, 1.0),
+    oma = c(0.15, 0.15, 0.15, 0.15),
+    mgp = c(2.45, 0.72, 0),
+    tcl = -0.25,
+    cex.axis = 0.82,
+    cex.lab = 0.90)
+for (i in seq_along(names(pred_sets))) {
+  nm <- names(pred_sets)[i]
+  null_auc <- perm_null$Permuted_AUC[perm_null$Assessment_layer == nm]
+  obs <- perm_raw$Observed_AUC[perm_raw$Assessment_layer == nm][1]
+  plot_one_permutation(null_auc, obs, LETTERS[i], add_panel_letter = TRUE)
+}
+par(oldpar)
+dev.off()
+
+# Separate high-resolution panels.
+for (i in seq_along(names(pred_sets))) {
+  nm <- names(pred_sets)[i]
+  null_auc <- perm_null$Permuted_AUC[perm_null$Assessment_layer == nm]
+  obs <- perm_raw$Observed_AUC[perm_raw$Assessment_layer == nm][1]
+
+  png(file.path(OUT_DIR, paste0("Figure_4_14", LETTERS[i], "_Permutation_", gsub("[^A-Za-z0-9]+", "_", nm), ".png")),
+      width = 6.4, height = 3.7, units = "in", res = PLOT_DPI)
+  oldpar <- par(no.readonly = TRUE)
+  par(mar = c(4.0, 4.3, 2.1, 1.0), mgp = c(2.45, 0.72, 0),
+      tcl = -0.25, cex.axis = 0.85, cex.lab = 0.92)
+  plot_one_permutation(null_auc, obs, LETTERS[i], add_panel_letter = TRUE)
+  par(oldpar)
+  dev.off()
+}
+
+###############################################################################
+# 12) OPTIONAL WORD DOCUMENT WITH TABLES
+###############################################################################
+
+if (requireNamespace("officer", quietly = TRUE) && requireNamespace("flextable", quietly = TRUE)) {
+  doc <- officer::read_docx()
+  doc <- officer::body_add_par(doc, "Reviewer/thesis tables generated from forced 83/21 split", style = "heading 1")
+  doc <- officer::body_add_par(doc, "Table 4.9. Internal AUC estimates and 95% confidence intervals for the locked three-miRNA Random Forest model.", style = "Normal")
+  doc <- flextable::body_add_flextable(doc, flextable::autofit(flextable::flextable(auc_thesis)))
+  doc <- officer::body_add_par(doc, "Table A.15. Threshold-dependent classification metrics, exact 95% confidence intervals and Brier scores.", style = "Normal")
+  doc <- flextable::body_add_flextable(doc, flextable::autofit(flextable::flextable(metrics_thesis)))
+  doc <- officer::body_add_par(doc, "Table A.16. Calibration-bin summaries for internal locked-model tumor-probability predictions.", style = "Normal")
+  doc <- flextable::body_add_flextable(doc, flextable::autofit(flextable::flextable(calib_thesis)))
+  doc <- officer::body_add_par(doc, "Table A.17. Permutation-based AUC validation of the locked three-miRNA model.", style = "Normal")
+  doc <- flextable::body_add_flextable(doc, flextable::autofit(flextable::flextable(perm_thesis)))
+  print(doc, target = file.path(OUT_DIR, "Thesis_Tables_FORCED_83_21.docx"))
+}
+
+###############################################################################
+# 13) FINISH
+###############################################################################
+
+cat("\nDONE. Forced 83/21 internal reviewer/thesis outputs were written to this NEW run folder:\n", OUT_DIR, "\n\n")
+cat("Main files:\n")
+cat("- Table_4_9_Internal_AUC_CI_THESIS_READY_FORCED_83_21.csv\n")
+cat("- Table_A15_Threshold_Metrics_Brier_THESIS_READY_FORCED_83_21.csv\n")
+cat("- Table_A16_Calibration_Bins_THESIS_READY_FORCED_83_21.csv\n")
+cat("- Table_A17_Permutation_AUC_THESIS_READY_FORCED_83_21.csv\n")
+cat("- Figure_4_13_Calibration_Plots_FORCED_83_21.png/pdf\n")
+cat("- Figure_4_14_Permutation_AUC_Null_Distributions_FORCED_83_21.png/pdf\n")
